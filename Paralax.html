@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Jet + Realistic Parallax Mountains</title>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { overflow: hidden; background: #05080f; }
+    #bg { position: fixed; inset: 0; display: block; }
+  </style>
+</head>
+<body>
+  <canvas id="bg"></canvas>
+
+  <script>
+    (() => {
+      const canvas = document.getElementById("bg");
+      const ctx = canvas.getContext("2d", { alpha: false });
+
+      // ---------- Resize ----------
+      let W = 0, H = 0, DPR = 1;
+      function resize() {
+        DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+        W = Math.floor(window.innerWidth);
+        H = Math.floor(window.innerHeight);
+        canvas.width = Math.floor(W * DPR);
+        canvas.height = Math.floor(H * DPR);
+        canvas.style.width = W + "px";
+        canvas.style.height = H + "px";
+        ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+      }
+      window.addEventListener("resize", resize);
+      resize();
+
+      // ---------- Jet ----------
+      const jetImg = new Image();
+      jetImg.src = "jet.png"; // facing RIGHT
+      let jetReady = false;
+      jetImg.onload = () => (jetReady = true);
+
+      // ---------- Utilities ----------
+      const lerp = (a, b, t) => a + (b - a) * t;
+      const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+      // ---------- Pointer ----------
+      const pointer = { x: W * 0.62, y: H * 0.5, active: false };
+      window.addEventListener("mousemove", (e) => {
+        pointer.x = e.clientX;
+        pointer.y = e.clientY;
+        pointer.active = true;
+      });
+      window.addEventListener("mouseleave", () => { pointer.active = false; });
+
+      // ============================================================
+      //  REALISTIC MOUNTAINS (better shading + fog + less "cartoony")
+      //  - More atmospheric perspective (far layers lighter + hazier)
+      //  - Subtle ridge lighting and valley shadowing
+      //  - Fog bands that sit between depth layers
+      //  - Front mountains are SHORTER (your request)
+      // ============================================================
+
+      // Row 1, Row 2 (Row 2 semi-transparent)
+      const layersBack = [
+        { depth: 0.12, baseY: 0.66, amp: 0.30, freq: 0.55, colA: "#07111f", colB: "#24435f", haze: 0.50, rough: 0.32, sharp: 1.45, alpha: 1.00 },
+        { depth: 0.22, baseY: 0.70, amp: 0.30, freq: 0.70, colA: "#06111f", colB: "#2a4f73", haze: 0.38, rough: 0.42, sharp: 1.65, alpha: 0.82 }, // semi-transparent
+      ];
+
+      // Behind jet (corridor ceiling)
+      const layersBetween = [
+        { depth: 0.44, baseY: 0.76, amp: 0.30, freq: 0.86, colA: "#05101b", colB: "#2e5a82", haze: 0.22, rough: 0.58, sharp: 1.85, alpha: 1.00 },
+      ];
+
+      // In front of jet (occluder) — SHORTER than before
+      const layersFront = [
+        { depth: 0.66, baseY: 0.88, amp: 0.16, freq: 0.88, colA: "#040c14", colB: "#2d5a86", haze: 0.10, rough: 0.30, sharp: 1.35, alpha: 1.00 },
+      ];
+
+      // Closest foreground — even SHORTER
+      const layersForeground = [
+        { depth: 0.90, baseY: 0.92, amp: 0.12, freq: 0.95, colA: "#030910", colB: "#2a587f", haze: 0.02, rough: 0.26, sharp: 1.25, alpha: 1.00 },
+      ];
+
+      // --- Ridged terrain (multi-octave + light domain warp) ---
+      function ridgeY(x, t, layer) {
+        const nx = x / W;
+
+        // small domain warp for natural variance
+        const warp =
+          Math.sin((nx * 2.0 * Math.PI) * 0.45 + t * 0.08) * 0.020 +
+          Math.sin((nx * 2.0 * Math.PI) * 1.10 - t * 0.05) * 0.012;
+
+        const u = nx + warp;
+
+        // large forms
+        const s1 = Math.sin((u * 2.0 * Math.PI) * layer.freq + t * 0.10);
+        const s2 = Math.sin((u * 4.0 * Math.PI) * (layer.freq * 0.85) - t * 0.08);
+        const s3 = Math.sin((u * 8.0 * Math.PI) * (layer.freq * 0.60) + t * 0.05);
+
+        // finer detail (kept subtle so it looks "real")
+        const d1 = Math.sin((u * 18.0 * Math.PI) * (layer.freq * 0.55) + t * 0.03);
+        const d2 = Math.sin((u * 33.0 * Math.PI) * (layer.freq * 0.48) - t * 0.02);
+
+        let v = (s1 * 0.55 + s2 * 0.30 + s3 * 0.15);
+        v += (d1 * 0.55 + d2 * 0.45) * layer.rough * 0.18;
+
+        // ridged transform -> sharper peaks without looking spiky
+        const ridged = 1.0 - Math.abs(v);
+        const shaped = Math.pow(clamp(ridged, 0, 1), layer.sharp);
+
+        return layer.baseY * H - shaped * (layer.amp * H);
+      }
+
+      // --- Sky + distant haze ---
+      function drawSky(now) {
+        const g = ctx.createLinearGradient(0, 0, 0, H);
+        g.addColorStop(0.0, "#02050b");
+        g.addColorStop(0.50, "#07162a");
+        g.addColorStop(1.0, "#0b2a3f");
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, W, H);
+
+        // horizon glow
+        ctx.save();
+        ctx.globalAlpha = 0.20;
+        const hg = ctx.createLinearGradient(0, H * 0.42, 0, H);
+        hg.addColorStop(0, "rgba(210,235,255,0)");
+        hg.addColorStop(0.55, "rgba(210,235,255,0.12)");
+        hg.addColorStop(1, "rgba(210,235,255,0)");
+        ctx.fillStyle = hg;
+        ctx.fillRect(0, H * 0.35, W, H * 0.65);
+        ctx.restore();
+      }
+
+      function drawFogBand(yCenter, strength) {
+        ctx.save();
+        ctx.globalAlpha = strength;
+        const fg = ctx.createLinearGradient(0, yCenter - H * 0.14, 0, yCenter + H * 0.14);
+        fg.addColorStop(0.0, "rgba(210,235,255,0.00)");
+        fg.addColorStop(0.45, "rgba(210,235,255,0.10)");
+        fg.addColorStop(0.55, "rgba(210,235,255,0.10)");
+        fg.addColorStop(1.0, "rgba(210,235,255,0.00)");
+        ctx.fillStyle = fg;
+        ctx.fillRect(0, yCenter - H * 0.18, W, H * 0.36);
+        ctx.restore();
+      }
+
+      // --- Fill + shading pass (adds realism) ---
+      function fillMountain(layer, t, shiftX, shiftY) {
+        ctx.save();
+        ctx.globalAlpha = layer.alpha ?? 1.0;
+
+        // gradient fill (simulates light & depth)
+        const topY = layer.baseY * H - layer.amp * H - 180;
+        const bottomY = H;
+        const grad = ctx.createLinearGradient(0, topY + shiftY, 0, bottomY);
+        grad.addColorStop(0.00, layer.colB);
+        grad.addColorStop(0.60, layer.colA);
+        grad.addColorStop(1.00, "#02050a");
+
+        // overscan so parallax never reveals edges
+        const overscan = 260;
+        const left = -overscan, right = W + overscan;
+
+        // silhouette path
+        const step = Math.max(5, Math.floor(W / 360)); // fairly smooth
+        const ridge = new Array(Math.floor((right - left) / step) + 2);
+
+        ctx.beginPath();
+        ctx.moveTo(0, H);
+
+        let i = 0;
+        for (let x = left; x <= right + step; x += step) {
+          const rx = x + shiftX;
+          const y = ridgeY(rx, t, layer) + shiftY;
+          ridge[i++] = { x, y };
+          ctx.lineTo(clamp(x, 0, W), y);
+        }
+
+        ctx.lineTo(W, H);
+        ctx.closePath();
+
+        // base fill
+        ctx.fillStyle = grad;
+        ctx.fill();
+
+        // atmospheric haze overlay (farther layers only)
+        if (layer.haze > 0.001) {
+          ctx.save();
+          ctx.globalAlpha = (layer.alpha ?? 1) * layer.haze;
+          const hazeGrad = ctx.createLinearGradient(0, topY, 0, bottomY);
+          hazeGrad.addColorStop(0.0, "rgba(215,235,255,0.30)");
+          hazeGrad.addColorStop(1.0, "rgba(215,235,255,0.00)");
+          ctx.fillStyle = hazeGrad;
+          ctx.fill();
+          ctx.restore();
+        }
+
+        // ridge lighting: compute slope to shade valleys vs peaks (subtle realism)
+        // This makes it look less flat/cartoon.
+        ctx.save();
+        ctx.globalAlpha = 0.12 * (layer.alpha ?? 1);
+        ctx.lineWidth = 1;
+        for (let j = 2; j < i - 2; j++) {
+          const p0 = ridge[j - 2], p1 = ridge[j], p2 = ridge[j + 2];
+          const dx = (p2.x - p0.x);
+          const dy = (p2.y - p0.y);
+          const slope = dy / Math.max(1e-6, dx); // -inf..inf
+
+          // light from upper-right: slopes facing right get a bit brighter
+          const light = clamp(0.5 + slope * -6.0, 0.0, 1.0);
+          const shade = clamp(0.55 + (0.5 - light) * 0.6, 0.25, 0.85);
+
+          ctx.strokeStyle = `rgba(230,245,255,${0.04 + light * 0.05})`;
+          ctx.beginPath();
+          const x = clamp(p1.x, 0, W);
+          ctx.moveTo(x, p1.y);
+          ctx.lineTo(x, p1.y + 18 * shade);
+          ctx.stroke();
+        }
+        ctx.restore();
+
+        ctx.restore();
+      }
+
+      function drawMountains(layers, t, parallaxX, parallaxY) {
+        for (const layer of layers) {
+          const shiftX = parallaxX * (1 - layer.depth);
+          const shiftY = parallaxY * (1 - layer.depth) * 0.35;
+          fillMountain(layer, t, shiftX, shiftY);
+        }
+      }
+
+      // ---------- Jet flight between layers ----------
+      const jet = {
+        x: W * 0.15,
+        y: H * 0.58,
+        vx: 235,
+        angle: 0,
+        wobble: 0,
+        scale: 0.62
+      };
+
+      function valleyBandY(t, parallaxX, parallaxY, xScreen) {
+        const behind = layersBetween[0]; // corridor ceiling
+        const front  = layersFront[0];   // corridor floor/occluder
+
+        const behindShiftX = parallaxX * (1 - behind.depth);
+        const behindShiftY = parallaxY * (1 - behind.depth) * 0.35;
+        const frontShiftX  = parallaxX * (1 - front.depth);
+        const frontShiftY  = parallaxY * (1 - front.depth) * 0.35;
+
+        const yTop = ridgeY(xScreen + behindShiftX, t, behind) + behindShiftY;
+        const yBot = ridgeY(xScreen + frontShiftX,  t, front)  + frontShiftY;
+        return { yTop, yBot };
+      }
+
+      function drawJet(dt, now, parallaxX, parallaxY) {
+        const t = now * 0.001;
+
+        // cruise if mouse leaves
+        if (!pointer.active) {
+          pointer.x = lerp(pointer.x, W * 0.62, 0.02);
+          pointer.y = lerp(pointer.y, H * (0.52 + 0.10 * Math.sin(now * 0.00040)), 0.02);
+        }
+
+        jet.x += jet.vx * dt;
+        if (jet.x > W + 280) jet.x = -280;
+
+        // keep jet between "ceiling" and "floor"
+        const band = valleyBandY(t, parallaxX, parallaxY, clamp(jet.x, 0, W));
+        const corridor = Math.max(110, (band.yBot - band.yTop));
+        const margin = clamp(corridor * 0.22, 34, 76);
+
+        const minY = band.yTop + margin;
+        const maxY = band.yBot - margin;
+
+        const desiredY = clamp(pointer.y, minY, maxY);
+        jet.y = lerp(jet.y, desiredY, 0.07);
+
+        // bank based on vertical adjustment
+        const dy = desiredY - jet.y;
+        jet.angle = lerp(jet.angle, clamp(dy / 200, -0.34, 0.34), 0.12);
+
+        jet.wobble += dt * 2.0;
+        const wobbleY = Math.sin(jet.wobble) * 4;
+
+        // contrail (subtle)
+        ctx.save();
+        ctx.globalAlpha = 0.17 - Math.abs(jet.angle) * 0.07;
+        ctx.strokeStyle = "rgba(220,240,255,0.9)";
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(jet.x - 12, jet.y + wobbleY);
+        ctx.quadraticCurveTo(jet.x - 150, jet.y + wobbleY + 10, jet.x - 340, jet.y + wobbleY + 26);
+        ctx.stroke();
+        ctx.restore();
+
+        // draw jet sprite
+        const px = jet.x + parallaxX * 0.018;
+        const py = jet.y + wobbleY + parallaxY * 0.012;
+
+        ctx.save();
+        ctx.translate(px, py);
+        ctx.rotate(jet.angle);
+
+        const baseSize = Math.min(W, H) * 0.24;
+        const w = baseSize * jet.scale;
+        const h = w * 0.55;
+
+        if (jetReady) {
+          ctx.imageSmoothingEnabled = true;
+          ctx.drawImage(jetImg, -w * 0.5, -h * 0.5, w, h);
+        } else {
+          ctx.fillStyle = "rgba(255,255,255,0.9)";
+          ctx.beginPath();
+          ctx.moveTo(w * 0.55, 0);
+          ctx.lineTo(-w * 0.35, -h * 0.35);
+          ctx.lineTo(-w * 0.35,  h * 0.35);
+          ctx.closePath();
+          ctx.fill();
+        }
+
+        ctx.restore();
+      }
+
+      // ---------- Main loop ----------
+      let last = performance.now();
+      function tick(now) {
+        const dt = Math.min(0.033, (now - last) / 1000);
+        last = now;
+
+        const cx = (pointer.x / W) * 2 - 1;
+        const cy = (pointer.y / H) * 2 - 1;
+        const parallaxX = -cx * 135;
+        const parallaxY = -cy * 100;
+
+        drawSky(now);
+
+        // Back layers (with transparent 2nd row)
+        drawMountains(layersBack, now * 0.001, parallaxX, parallaxY);
+        drawFogBand(H * 0.54, 0.10);
+
+        // Ceiling behind jet
+        drawMountains(layersBetween, now * 0.001, parallaxX, parallaxY);
+
+        // Jet between layers
+        drawJet(dt, now, parallaxX, parallaxY);
+
+        // Front occluders (SHORT)
+        drawMountains(layersFront, now * 0.001, parallaxX, parallaxY);
+        drawFogBand(H * 0.76, 0.06);
+
+        // Foreground (SHORTEST)
+        drawMountains(layersForeground, now * 0.001, parallaxX, parallaxY);
+
+        requestAnimationFrame(tick);
+      }
+      requestAnimationFrame(tick);
+    })();
+  </script>
+</body>
+</html>
